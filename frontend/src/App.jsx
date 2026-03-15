@@ -1,900 +1,498 @@
-// App.jsx — OpenClaw Mission Control Dashboard
-import React, { useState, useEffect, useMemo } from 'react';
+// App.jsx — OpenClaw Mission Control: Pixel Art Office + Live Dashboard
+// Connects to bridge WebSocket and maps agent state to office scene positions
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useBridge } from './hooks/useBridge';
-import { PixelScene } from './components/PixelScene';
 
-// ---- Configuration ----
 const BRIDGE_WS = import.meta.env.VITE_BRIDGE_URL || 'ws://localhost:3001/ws';
+const PX = 4;
+const CW = 190, CH = 120;
 
-// ---- Status config ----
-const STATUS_CONFIG = {
-  working:  { label: 'WORKING',  color: '#00ff88', bg: '#00ff8818', pulse: true },
-  tool_use: { label: 'TOOL USE', color: '#ffaa00', bg: '#ffaa0018', pulse: true },
-  idle:     { label: 'IDLE',     color: '#666',    bg: '#66666618', pulse: false },
-  error:    { label: 'ERROR',    color: '#ff4444', bg: '#ff444418', pulse: true },
-  offline:  { label: 'OFFLINE',  color: '#333',    bg: '#33333318', pulse: false },
+// ---- Zone mapping: agent status/tool → office location ----
+const ZONES = {
+  idle:     { x: 88,  y: 68, label: 'Break room',   bubble: 'Taking a break...' },
+  working:  { x: 22,  y: 56, label: 'Work desk',     bubble: 'Thinking...' },
+  youtube:  { x: 46,  y: 56, label: 'Media desk',    bubble: 'Scraping video...' },
+  search:   { x: 98,  y: 50, label: 'Library',       bubble: 'Researching...' },
+  sheets:   { x: 140, y: 62, label: 'Data desk',     bubble: 'Writing data...' },
+  telegram: { x: 155, y: 82, label: 'Comms desk',    bubble: 'Sending report...' },
+  error:    { x: 158, y: 48, label: 'Server rack',   bubble: 'Something broke!' },
 };
 
-// ---- Main App ----
-export default function App() {
-  const { state, connected, reconnecting } = useBridge(BRIDGE_WS);
-  const [now, setNow] = useState(Date.now());
-  const [viewMode, setViewMode] = useState('pixel'); // 'card' | 'pixel'
+const TOOL_ZONES = [
+  { p: /youtube|yt_scraper|yt-scraper/i, z: 'youtube' },
+  { p: /perplexity|web_search|sonar/i,   z: 'search' },
+  { p: /google_sheets|gsheet|spreadsheet/i, z: 'sheets' },
+  { p: /telegram|tg_send|tg_post/i,     z: 'telegram' },
+];
 
-  // Tick every second for relative timestamps
+function resolveZone(a) {
+  if (!a) return 'idle';
+  if (a.status === 'error') return 'error';
+  if (a.status === 'offline' || a.status === 'idle') return 'idle';
+  if (a.status === 'tool_use' && a.currentTool?.name) {
+    for (const m of TOOL_ZONES) { if (m.p.test(a.currentTool.name)) return m.z; }
+    return 'working';
+  }
+  return 'working';
+}
+
+const STATUS_CFG = {
+  working:  { label: 'WORKING',  color: '#00ff88' },
+  tool_use: { label: 'TOOL USE', color: '#ffaa00' },
+  idle:     { label: 'IDLE',     color: '#666' },
+  error:    { label: 'ERROR',    color: '#ff4444' },
+  offline:  { label: 'OFFLINE',  color: '#333' },
+};
+
+// ---- Pixel Art Colors ----
+const P = {
+  wallBrick:'#a0705a', brickLine:'#8a6050', brickHi:'#b8846e',
+  wallWood:'#c4a882', woodLine:'#b0946e', woodHi:'#d4b892',
+  wallRight:'#d4c4a0', wallRightHi:'#e0d0b0',
+  floorA:'#e8d8c0', floorB:'#dccaae', trim:'#8a6a4a', trimHi:'#a0805a',
+  deskTop:'#9a7a5a', deskFront:'#7a5e42', deskLeg:'#6a5038',
+  mon:'#222', scrGreen:'#1a442a', scrBlue:'#1a2a44',
+  books:['#7755aa','#5577cc','#aa5533','#338855','#cc7733','#cc4455'],
+  shelf:'#8a6a4a',
+  couch:'#887766', couchDk:'#706050', couchPil:'#aa9977',
+  chrSeat:'#c8b898', chrBack:'#b8a888', chrLeg:'#8a7a5a',
+  coffee:'#666', coffeeDk:'#444', coffeeRed:'#aa3333',
+  cat:'#aaa', catDk:'#888', catEar:'#bbb', catBed:'#996655', catBedIn:'#bb8877',
+  plant:'#3a7a3a', plantDk:'#2a6a2a', pot:'#aa6644', potDk:'#884422',
+  lampShade:'#eedd99', lampPole:'#999', lamp:'#ddcc88',
+  frame:'#6a5a3a', photo:'#ccaa88',
+  srv:'#333', srvSlot:'#444', srvG:'#44ff44', srvR:'#ff4444', srvY:'#ffaa00',
+  rug:'#8a5a4a', rugPat:'#9a6a5a',
+  skin:'#ffcc88', hair:'#553322',
+  shirt:'#7755bb', shirtDk:'#5544aa', pants:'#444', shoes:'#333',
+  winBg:'#1a2844', star:'#aaccff', winFrame:'#8a7a5a',
+  poster:'#ddccaa', posterArt:'#aa5533',
+  signBg:'#2a5a3a', signTxt:'#ddcc66', signBdr:'#4a7a5a',
+};
+
+// ===========================================================
+// PIXEL ART CANVAS
+// ===========================================================
+function OfficeCanvas({ agents }) {
+  const ref = useRef(null);
+  const pos = useRef({});
+  const tgt = useRef({});
+  const bub = useRef({});
+
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!agents) return;
+    for (const [id, agent] of Object.entries(agents)) {
+      const zone = resolveZone(agent);
+      const z = ZONES[zone] || ZONES.idle;
+      if (!pos.current[id]) pos.current[id] = { x: z.x, y: z.y };
+      tgt.current[id] = { x: z.x, y: z.y };
+      const newText = agent.currentTool?.name
+        ? `${agent.currentTool.name}`
+        : (ZONES[zone]?.bubble || 'Idle...');
+      if (bub.current[id]?.text !== newText) {
+        bub.current[id] = { text: newText, show: false };
+        setTimeout(() => { if (bub.current[id]) bub.current[id].show = true; }, 1200);
+      }
+    }
+  }, [agents]);
+
+  useEffect(() => {
+    const cv = ref.current;
+    if (!cv) return;
+    const ctx = cv.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    let anim;
+
+    const r = (x,y,w,h,c) => { ctx.fillStyle=c; ctx.fillRect(x,y,w,h); };
+    const px = (x,y,c) => r(x,y,1,1,c);
+
+    function walls() {
+      for(let y=0;y<42;y++) for(let x=0;x<65;x++){
+        let c=P.wallBrick;
+        if(y%5===0)c=P.brickLine; else if(y%5===1&&x%8===0)c=P.brickLine;
+        else if(y%5===3&&(x+4)%8===0)c=P.brickLine; else if((x+y)%7===0)c=P.brickHi;
+        r(x,y,1,1,c);
+      }
+      for(let y=0;y<42;y++) for(let x=65;x<130;x++){
+        let c=P.wallWood; if(x%12===0)c=P.woodLine; else if((x+y*3)%17===0)c=P.woodHi;
+        r(x,y,1,1,c);
+      }
+      for(let y=0;y<42;y++) for(let x=130;x<CW;x++){
+        let c=P.wallRight; if((x+y)%11===0)c=P.wallRightHi; r(x,y,1,1,c);
+      }
+      r(0,42,CW,2,P.trim); r(0,41,CW,1,P.trimHi);
+    }
+
+    function floor() {
+      for(let y=44;y<CH;y++) for(let x=0;x<CW;x++) r(x,y,1,1,((x+y)%2===0)?P.floorA:P.floorB);
+      for(let y=62;y<80;y++) for(let x=70;x<115;x++){
+        let c=P.rug;
+        if(x===70||x===114||y===62||y===79)c=P.rugPat; else if((x+y)%4===0)c=P.rugPat;
+        r(x,y,1,1,c);
+      }
+    }
+
+    function win(x,y,w,h){
+      r(x-1,y-1,w+2,h+2,P.winFrame); r(x,y,w,h,P.winBg);
+      r(x+w/2,y,1,h,'#7a6a4a'); r(x,y+h/2,w,1,'#7a6a4a');
+      [[3,3],[w-4,5],[5,h-4],[w-6,2]].forEach(([sx,sy])=>px(x+sx,y+sy,P.star));
+    }
+
+    function desk(x,y){
+      r(x,y,30,2,P.deskTop); r(x,y+2,30,8,P.deskFront);
+      r(x+1,y+10,2,5,P.deskLeg); r(x+27,y+10,2,5,P.deskLeg);
+      r(x+2,y+4,12,1,'#6a5038'); r(x+2,y+7,12,1,'#6a5038');
+      px(x+8,y+3,P.trimHi); px(x+8,y+6,P.trimHi);
+    }
+
+    function mon(x,y,sc){
+      r(x,y,10,8,P.mon); r(x+1,y+1,8,6,sc); r(x+4,y+8,2,2,P.mon); r(x+2,y+10,6,1,'#555');
+      if(sc!=='#111') for(let i=0;i<3;i++) px(x+2+i*2,y+2,'#ffffff20');
+    }
+
+    function chair(x,y){
+      r(x,y,10,3,P.chrBack); r(x+1,y+3,8,5,P.chrSeat);
+      r(x+1,y+8,2,3,P.chrLeg); r(x+7,y+8,2,3,P.chrLeg);
+    }
+
+    function couch(x,y){
+      r(x,y,30,4,P.couch); r(x,y+4,30,8,P.couchDk);
+      r(x-2,y+2,4,10,P.couch); r(x+28,y+2,4,10,P.couch);
+      r(x+4,y+5,8,4,P.couchPil); r(x+18,y+5,8,4,P.couchPil);
+    }
+
+    function coffeeMach(x,y){
+      r(x,y,8,12,P.coffee); r(x,y,8,2,P.coffeeDk);
+      r(x+2,y+3,4,4,P.coffeeDk); px(x+6,y+4,P.coffeeRed); px(x+6,y+6,P.srvG);
+      r(x+2,y+9,3,2,'#ddd'); r(x+5,y+10,1,1,'#ddd');
+    }
+
+    function bookshelf(x,y){
+      r(x,y,14,30,P.shelf);
+      for(let row=0;row<4;row++){
+        let sy=y+2+row*7; r(x+1,sy+5,12,1,P.shelf);
+        let bx=x+1;
+        for(let b=0;b<4;b++){
+          let bh=4+Math.floor(Math.sin(row*3+b*7)*1.5);
+          r(bx,sy+5-bh,3,bh,P.books[(row*4+b)%6]); bx+=3;
+        }
+      }
+    }
+
+    function plant(x,y){
+      r(x+1,y+5,4,4,P.pot); r(x+2,y+8,2,1,P.potDk);
+      for(let i=0;i<5;i++){
+        r(x+3+Math.sin(i*1.8)*3, y+Math.cos(i*1.3)*3, 2, 3, i%2?P.plant:P.plantDk);
+      }
+    }
+
+    function lamp(x,y){
+      r(x+2,y,6,4,P.lampShade); r(x+4,y+4,2,8,P.lampPole);
+      r(x+2,y+12,6,1,P.lampPole); px(x+4,y+3,P.lamp); px(x+5,y+3,P.lamp);
+    }
+
+    function cat(x,y){
+      r(x,y+2,10,4,P.cat); r(x+1,y+3,8,2,P.catDk);
+      r(x+8,y,4,4,P.cat); px(x+8,y-1,P.catEar); px(x+11,y-1,P.catEar);
+      r(x+9,y+1,1,1,'#222'); r(x+11,y+1,1,1,'#222');
+      r(x-2,y+3,3,1,P.cat); px(x-3,y+2,P.cat);
+      r(x-4,y+5,16,3,P.catBed); r(x-3,y+4,14,1,P.catBedIn);
+    }
+
+    function serverRack(x,y){
+      r(x,y,10,24,P.srv); r(x,y,10,1,'#555');
+      const lc=[P.srvG,P.srvG,P.srvY,P.srvY,P.srvR];
+      for(let i=0;i<5;i++){
+        r(x+1,y+2+i*4,8,3,P.srvSlot);
+        if(Math.sin(Date.now()/(400+i*200)+i)>0) px(x+8,y+3+i*4,lc[i]);
+      }
+    }
+
+    function drawFrame(x,y,w,h,c){ r(x,y,w,h,P.frame); r(x+1,y+1,w-2,h-2,c||P.photo); }
+
+    function sign(x,y,text){
+      r(x,y,30,10,P.signBg); r(x,y,30,1,P.signBdr); r(x,y+9,30,1,P.signBdr);
+      ctx.fillStyle=P.signTxt; ctx.font='5px monospace'; ctx.fillText(text,x+2,y+7);
+    }
+
+    function poster(x,y){
+      r(x,y,12,16,P.frame); r(x+1,y+1,10,14,P.poster);
+      r(x+3,y+3,6,6,P.posterArt); r(x+2,y+11,8,2,'#6a5a3a');
+    }
+
+    function agent(x,y,id){
+      let ax=Math.round(x), ay=Math.round(y);
+      r(ax+1,ay+13,8,2,'#00000020');
+      let moving=false;
+      const p=pos.current[id], t=tgt.current[id];
+      if(p&&t){ let d=Math.sqrt((t.x-p.x)**2+(t.y-p.y)**2); moving=d>1; }
+      let lo=moving?Math.sin(Date.now()/150):0;
+      r(ax+2,ay+11+lo,2,3,P.pants); r(ax+6,ay+11-lo,2,3,P.pants);
+      r(ax+2,ay+13,2,1,P.shoes); r(ax+6,ay+13,2,1,P.shoes);
+      r(ax+1,ay+5,8,7,P.shirt); r(ax+2,ay+6,6,5,P.shirtDk);
+      let ab=moving?Math.sin(Date.now()/200):0;
+      r(ax-1,ay+5+ab,2,5,P.shirt); r(ax+9,ay+5-ab,2,5,P.shirt);
+      r(ax+1,ay,8,6,P.skin);
+      r(ax+1,ay-1,8,1,P.hair); r(ax,ay,1,3,P.hair); r(ax+9,ay,1,3,P.hair);
+      px(ax+3,ay+2,'#333'); px(ax+6,ay+2,'#333');
+      px(ax+4,ay+4,'#cc8866'); px(ax+5,ay+4,'#cc8866');
+
+      const b=bub.current[id];
+      if(b?.show&&b?.text){
+        let t2=b.text.length>18?b.text.substring(0,16)+'..':b.text;
+        let bw=t2.length*3+6, bx=ax+5-bw/2, by=ay-10;
+        if(bx<2)bx=2; if(bx+bw>CW-2)bx=CW-2-bw;
+        r(bx,by,bw,7,'#fff'); r(bx+Math.floor(bw/2),by+7,2,2,'#fff');
+        ctx.fillStyle='#333'; ctx.font='4px monospace'; ctx.fillText(t2,bx+3,by+5);
+      }
+    }
+
+    function draw(){
+      ctx.clearRect(0,0,cv.width,cv.height);
+      ctx.save(); ctx.scale(PX,PX);
+
+      walls(); floor();
+      r(64,0,1,CH,'#7a6050'); r(65,0,1,CH,'#8a7060');
+      r(129,0,1,CH,'#8a7a5a'); r(130,0,1,CH,'#9a8a6a');
+
+      win(15,8,16,14); win(82,8,16,14); win(148,8,16,14);
+      drawFrame(38,6,10,8); drawFrame(50,8,8,7,'#88aa88');
+      poster(110,4); sign(135,27,'OPENCLAW');
+      [[32],[92],[152]].forEach(([lx])=>{ r(lx,0,10,1,'#4a4255'); });
+
+      // Left room
+      desk(10,48); mon(13,42,P.scrGreen); mon(24,41,P.scrBlue);
+      chair(16,60); lamp(2,30); cat(42,72); plant(52,38);
+      r(42,50,15,2,P.deskTop); r(42,52,15,5,P.deskFront);
+      r(44,44,10,6,P.mon); r(45,45,8,4,'#331a22');
+      ctx.fillStyle='#cc3355';
+      ctx.beginPath(); ctx.moveTo(48,46); ctx.lineTo(51,47.5); ctx.lineTo(48,49); ctx.fill();
+
+      // Center room
+      couch(75,66); coffeeMach(68,48);
+      r(80,58,20,3,P.deskTop); r(82,61,2,3,P.deskLeg); r(96,61,2,3,P.deskLeg);
+      r(84,56,3,2,'#ddd'); r(90,57,3,2,'#eeddcc');
+      bookshelf(110,12);
+      r(96,44,12,4,P.chrBack); r(97,48,10,6,P.chrSeat);
+      r(95,46,2,8,'#b8a888'); r(107,46,2,8,'#b8a888');
+      plant(68,34); lamp(122,32); plant(124,76);
+
+      // Right room
+      r(135,56,22,2,P.deskTop); r(135,58,22,6,P.deskFront);
+      r(136,64,2,4,P.deskLeg); r(155,64,2,4,P.deskLeg);
+      mon(138,50,P.scrGreen); mon(148,49,P.scrGreen); chair(140,68);
+      r(150,78,18,2,P.deskTop); r(150,80,18,5,P.deskFront);
+      mon(153,72,P.scrBlue); r(163,73,5,4,'#33aadd'); px(164,74,'#fff');
+      serverRack(155,22); serverRack(167,22);
+      r(175,50,10,18,'#888');
+      r(176,52,8,4,'#777'); r(176,57,8,4,'#777'); r(176,62,8,4,'#777');
+      px(180,54,'#aa8855'); px(180,59,'#aa8855'); px(180,64,'#aa8855');
+      plant(178,36);
+
+      // Zone labels
+      ctx.font='4px monospace'; ctx.fillStyle='#ffffff25';
+      ctx.fillText('work',18,76); ctx.fillText('media',42,64);
+      ctx.fillText('break',83,84); ctx.fillText('library',96,62);
+      ctx.fillText('data',140,76); ctx.fillText('comms',152,92);
+
+      // Agents
+      for(const id of Object.keys(pos.current)){
+        const p2=pos.current[id], t2=tgt.current[id];
+        if(p2&&t2){
+          const dx=t2.x-p2.x, dy=t2.y-p2.y;
+          if(Math.sqrt(dx*dx+dy*dy)>0.5){ p2.x+=dx*0.04; p2.y+=dy*0.04; }
+          agent(p2.x, p2.y+Math.sin(Date.now()/300)*0.8, id);
+        }
+      }
+      if(Object.keys(pos.current).length===0){
+        agent(88, 68+Math.sin(Date.now()/300)*0.8, '_def');
+        if(!bub.current._def) bub.current._def={text:'Waiting for data...',show:true};
+      }
+
+      ctx.restore();
+      anim=requestAnimationFrame(draw);
+    }
+    draw();
+    return ()=>cancelAnimationFrame(anim);
+  },[]);
+
+  return <canvas ref={ref} width={CW*PX} height={CH*PX}
+    style={{width:'100%',maxWidth:'760px',display:'block',margin:'0 auto',borderRadius:'8px',imageRendering:'pixelated'}} />;
+}
+
+// ===========================================================
+// MAIN APP
+// ===========================================================
+export default function App(){
+  const {state,connected,reconnecting} = useBridge(BRIDGE_WS);
+  const [now,setNow] = useState(Date.now());
+  useEffect(()=>{ const t=setInterval(()=>setNow(Date.now()),1000); return()=>clearInterval(t); },[]);
+
+  const mainAgent = state?.agents?.main;
+  const zone = resolveZone(mainAgent);
+  const zi = ZONES[zone]||ZONES.idle;
+  const sc = mainAgent ? (STATUS_CFG[mainAgent.status]||STATUS_CFG.offline) : STATUS_CFG.offline;
 
   return (
-    <div style={styles.root}>
-      <style>{globalCSS}</style>
+    <div style={s.root}>
+      <style>{css}</style>
 
-      {/* Header */}
-      <header style={styles.header}>
-        <div style={styles.headerLeft}>
-          <div style={styles.logo}>⚔️</div>
+      <header style={s.header}>
+        <div style={s.hLeft}>
+          <span style={{fontSize:'24px'}}>&#9876;&#65039;</span>
           <div>
-            <h1 style={styles.title}>OPENCLAW MISSION CONTROL</h1>
-            <p style={styles.subtitle}>
-              {state?.gateway?.version || 'Connecting...'}
-            </p>
+            <h1 style={s.title}>OPENCLAW MISSION CONTROL</h1>
+            <p style={s.sub}>{state?.gateway?.version||'Connecting...'}</p>
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <button
-            onClick={() => setViewMode(v => v === 'card' ? 'pixel' : 'card')}
-            style={styles.viewToggle}
-          >
-            {viewMode === 'card' ? '🕹️ PIXEL' : '📋 CARDS'}
-          </button>
-          <ConnectionBadge connected={connected} reconnecting={reconnecting} />
+        <div style={s.badge}>
+          <div style={{...s.dot,backgroundColor:connected?'#00ff88':reconnecting?'#ffaa00':'#ff4444',boxShadow:connected?'0 0 8px #00ff88':'none'}}/>
+          <span style={{...s.badgeTxt,color:connected?'#00ff88':reconnecting?'#ffaa00':'#ff4444'}}>
+            {connected?'LIVE':reconnecting?'RECONNECTING':'DISCONNECTED'}
+          </span>
         </div>
       </header>
 
-      {/* Main Content */}
-      {!state ? (
-        <LoadingState reconnecting={reconnecting} />
-      ) : viewMode === 'pixel' ? (
-        <div style={styles.pixelLayout}>
-          <PixelScene state={state} />
-          <div style={styles.pixelStrip}>
-            <AgentPanel agents={state.agents} now={now} compact />
-            <div style={{ flex: 1 }}>
-              <ActivityFeed log={state.activityLog} now={now} compact />
-            </div>
-          </div>
+      <div style={s.scene}>
+        <OfficeCanvas agents={state?.agents} />
+        <div style={s.locBar}>
+          <div style={{...s.locDot,backgroundColor:sc.color}}/>
+          <span style={{...s.locLabel,color:sc.color}}>{sc.label}</span>
+          <span style={s.sep}>—</span>
+          <span style={s.locZone}>{zi.label}</span>
+          {mainAgent?.currentTool&&<><span style={s.sep}>·</span><span style={s.locTool}>{mainAgent.currentTool.station?.icon||'🔧'} {mainAgent.currentTool.name}</span></>}
+          {mainAgent?.currentProvider&&<span style={s.locProv}>{mainAgent.currentProvider}/{mainAgent.currentModel}</span>}
         </div>
-      ) : (
-        <div style={styles.grid}>
-          {/* Left Column */}
-          <div style={styles.leftCol}>
-            <AgentPanel agents={state.agents} now={now} />
-            <GatewayPanel gateway={state.gateway} />
-          </div>
+      </div>
 
-          {/* Center Column */}
-          <div style={styles.centerCol}>
-            <ActivityFeed log={state.activityLog} now={now} />
-          </div>
-
-          {/* Right Column */}
-          <div style={styles.rightCol}>
-            <BudgetPanel budget={state.budget} />
-            <ToolStats tools={state.tools} />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---- Connection Badge ----
-function ConnectionBadge({ connected, reconnecting }) {
-  const dotColor = connected ? '#00ff88' : reconnecting ? '#ffaa00' : '#ff4444';
-  const label = connected ? 'LIVE' : reconnecting ? 'RECONNECTING' : 'DISCONNECTED';
-  return (
-    <div style={styles.badge}>
-      <div style={{
-        ...styles.dot,
-        backgroundColor: dotColor,
-        boxShadow: connected ? `0 0 8px ${dotColor}` : 'none',
-      }} />
-      <span style={{ ...styles.badgeText, color: dotColor }}>{label}</span>
-    </div>
-  );
-}
-
-// ---- Loading State ----
-function LoadingState({ reconnecting }) {
-  return (
-    <div style={styles.loading}>
-      <div style={styles.loadingIcon}>⚔️</div>
-      <p style={styles.loadingText}>
-        {reconnecting ? 'Reconnecting to bridge...' : 'Connecting to OpenClaw Bridge...'}
-      </p>
-      <p style={styles.loadingHint}>
-        Make sure the bridge is running on your Pi: <code style={styles.code}>cd bridge && npm start</code>
-      </p>
-    </div>
-  );
-}
-
-// ---- Agent Panel ----
-function AgentPanel({ agents, now, compact }) {
-  const agentList = Object.values(agents);
-
-  if (compact) {
-    return (
-      <div style={styles.compactAgents}>
-        {agentList.map(agent => {
-          const cfg = STATUS_CONFIG[agent.status] || STATUS_CONFIG.offline;
-          return (
-            <div key={agent.id} style={{ ...styles.compactAgent, borderColor: cfg.color }}>
-              <div style={{ ...styles.statusPill, color: cfg.color, backgroundColor: cfg.bg, marginBottom: '4px' }}>
-                {cfg.label}
-              </div>
-              <div style={{ fontSize: '11px', color: '#ccc', fontWeight: 600 }}>{agent.name}</div>
-              {agent.currentTool && (
-                <div style={{ fontSize: '10px', color: cfg.color, marginTop: '2px' }}>
-                  {agent.currentTool.name}
+      {state ? (
+        <div style={s.panels}>
+          {/* Activity Feed */}
+          <div style={{...s.panel,flex:2,minWidth:'260px'}}>
+            <div style={s.ph}><span style={s.phi}>&#128225;</span><span style={s.pht}>ACTIVITY FEED</span></div>
+            <div style={s.feedScroll}>
+              {(!state.activityLog||state.activityLog.length===0)?<div style={s.empty}>Waiting for events...</div>:
+              state.activityLog.slice(0,30).map((e,i)=>(
+                <div key={i} style={{...s.fi,opacity:Math.max(0.3,1-i*0.02)}}>
+                  <span style={s.fiIcon}>{{session:'🚀',prompt:'💬',tool:'🔧',error:'❌'}[e.type]||'•'}</span>
+                  <span style={s.fiAgent}>{e.agentName}</span>
+                  <span style={s.fiMsg}>{e.message}</span>
+                  <span style={s.fiTime}>{rel(e.timestamp,now)}</span>
                 </div>
-              )}
+              ))}
             </div>
-          );
-        })}
-      </div>
-    );
-  }
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelIcon}>🤖</span>
-        <span style={styles.panelTitle}>AGENTS</span>
-        <span style={styles.panelCount}>
-          {agentList.filter(a => a.status === 'working' || a.status === 'tool_use').length}/
-          {agentList.length} active
-        </span>
-      </div>
-
-      {agentList.map(agent => {
-        const cfg = STATUS_CONFIG[agent.status] || STATUS_CONFIG.offline;
-        const timeAgo = agent.lastActive ? relativeTime(agent.lastActive, now) : 'never';
-
-        return (
-          <div key={agent.id} style={{ ...styles.agentCard, borderLeftColor: cfg.color }}>
-            <div style={styles.agentTop}>
-              <div style={styles.agentName}>{agent.name}</div>
-              <div style={{
-                ...styles.statusPill,
-                color: cfg.color,
-                backgroundColor: cfg.bg,
-                animation: cfg.pulse ? 'pulse 2s ease-in-out infinite' : 'none',
-              }}>
-                {cfg.label}
-              </div>
-            </div>
-
-            {agent.currentTool && (
-              <div style={styles.agentTool}>
-                {agent.currentTool.station?.icon || '🔧'} {agent.currentTool.name}
-              </div>
-            )}
-
-            <div style={styles.agentMeta}>
-              {agent.currentProvider && (
-                <span style={styles.metaTag}>{agent.currentProvider}/{agent.currentModel}</span>
-              )}
-              <span style={styles.metaTime}>{timeAgo}</span>
-            </div>
-
-            {agent.taskPreview && (
-              <div style={styles.taskPreview}>{agent.taskPreview}</div>
-            )}
           </div>
-        );
-      })}
-    </div>
-  );
-}
 
-// ---- Gateway Panel ----
-function GatewayPanel({ gateway }) {
-  const isRunning = gateway.status === 'running';
-  const color = isRunning ? '#00ff88' : '#ff4444';
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelIcon}>🏗️</span>
-        <span style={styles.panelTitle}>GATEWAY</span>
-      </div>
-
-      <div style={{ ...styles.gatewayStatus, borderColor: color }}>
-        <div style={{ ...styles.gatewayDot, backgroundColor: color }} />
-        <span style={{ color }}>{gateway.status?.toUpperCase() || 'UNKNOWN'}</span>
-      </div>
-
-      <div style={styles.gatewayGrid}>
-        <GatewayItem label="VERSION" value={gateway.version || '—'} />
-        <GatewayItem label="PID" value={gateway.pid || '—'} />
-        <GatewayItem label="PORT" value={gateway.port || '—'} />
-        <GatewayItem label="TELEGRAM"
-          value={gateway.telegram?.connected
-            ? (gateway.telegram.bot || 'Connected')
-            : 'Disconnected'}
-          color={gateway.telegram?.connected ? '#00ff88' : '#ff4444'}
-        />
-      </div>
-
-      {gateway.lastChecked && (
-        <div style={styles.lastChecked}>
-          Last checked: {new Date(gateway.lastChecked).toLocaleTimeString()}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function GatewayItem({ label, value, color }) {
-  return (
-    <div style={styles.gwItem}>
-      <div style={styles.gwLabel}>{label}</div>
-      <div style={{ ...styles.gwValue, color: color || '#ccc' }}>{value}</div>
-    </div>
-  );
-}
-
-// ---- Activity Feed ----
-function ActivityFeed({ log, now, compact }) {
-  const typeIcons = {
-    session: '🚀',
-    prompt: '💬',
-    tool: '🔧',
-    error: '❌',
-  };
-
-  if (compact) {
-    return (
-      <div style={{ ...styles.panel, height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-        <div style={styles.panelHeader}>
-          <span style={styles.panelIcon}>📡</span>
-          <span style={styles.panelTitle}>ACTIVITY FEED</span>
-        </div>
-        <div style={{ ...styles.feedScroll, maxHeight: '120px' }}>
-          {(!log || log.length === 0) ? (
-            <div style={styles.emptyFeed}>Waiting for events...</div>
-          ) : (
-            log.slice(0, 12).map((entry, i) => (
-              <div key={i} style={{ ...styles.feedItem, opacity: Math.max(0.3, 1 - (i * 0.06)) }}>
-                <span style={styles.feedIcon}>{typeIcons[entry.type] || '•'}</span>
-                <span style={styles.feedAgent}>{entry.agentName}</span>
-                <span style={styles.feedMsg}>{entry.message}</span>
-                <span style={styles.feedTime}>{relativeTime(entry.timestamp, now)}</span>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ ...styles.panel, flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelIcon}>📡</span>
-        <span style={styles.panelTitle}>ACTIVITY FEED</span>
-      </div>
-
-      <div style={styles.feedScroll}>
-        {(!log || log.length === 0) ? (
-          <div style={styles.emptyFeed}>Waiting for events...</div>
-        ) : (
-          log.slice(0, 40).map((entry, i) => (
-            <div key={i} style={{
-              ...styles.feedItem,
-              opacity: Math.max(0.3, 1 - (i * 0.015)),
-            }}>
-              <span style={styles.feedIcon}>{typeIcons[entry.type] || '•'}</span>
-              <span style={styles.feedAgent}>{entry.agentName}</span>
-              <span style={styles.feedMsg}>{entry.message}</span>
-              <span style={styles.feedTime}>{relativeTime(entry.timestamp, now)}</span>
+          {/* Budget + Gateway */}
+          <div style={{...s.panel,flex:1,minWidth:'210px'}}>
+            <div style={s.ph}><span style={s.phi}>&#128176;</span><span style={s.pht}>API BUDGET</span></div>
+            {Object.values(state.budget).length===0?<div style={s.empty}>No usage yet</div>:
+            Object.values(state.budget).map(p=>{
+              const pct=p.limits?.monthlyTokens?Math.min(100,(p.tokensUsed/p.limits.monthlyTokens)*100):0;
+              const bc=pct>85?'#ff4444':pct>60?'#ffaa00':'#00ff88';
+              return(
+                <div key={p.provider} style={s.bRow}>
+                  <div style={s.bHead}><span style={s.bName}>{p.provider}</span><span style={s.bCost}>${p.costUsd.toFixed(2)}{p.limits?.monthlyUsd?` / $${p.limits.monthlyUsd}`:''}</span></div>
+                  <div style={s.barTrack}><div style={{...s.barFill,width:`${pct}%`,backgroundColor:bc,boxShadow:`0 0 6px ${bc}40`}}/></div>
+                  <div style={s.bFoot}><span>{fmtTok(p.tokensUsed)} tokens</span><span>{p.callCount} calls</span><span>{pct.toFixed(0)}%</span></div>
+                </div>
+              );
+            })}
+            <div style={{...s.ph,marginTop:'14px'}}><span style={s.phi}>&#127959;&#65039;</span><span style={s.pht}>GATEWAY</span></div>
+            <div style={s.gwRow}>
+              <div style={{width:8,height:8,borderRadius:'50%',background:state.gateway.status==='running'?'#00ff88':'#ff4444'}}/>
+              <span style={{color:state.gateway.status==='running'?'#00ff88':'#ff4444',fontSize:'11px',fontWeight:600}}>{state.gateway.status?.toUpperCase()||'UNKNOWN'}</span>
+              {state.gateway.telegram?.connected&&<span style={{fontSize:'9px',color:'#33aadd'}}>{state.gateway.telegram.bot||'TG'}</span>}
+              <span style={{fontSize:'9px',color:'#444',marginLeft:'auto'}}>{state.gateway.version||''}</span>
             </div>
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---- Budget Panel ----
-function BudgetPanel({ budget }) {
-  const providers = Object.values(budget);
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelIcon}>💰</span>
-        <span style={styles.panelTitle}>API BUDGET</span>
-      </div>
-
-      {providers.length === 0 ? (
-        <div style={styles.emptyFeed}>No API usage tracked yet</div>
-      ) : (
-        providers.map(p => {
-          const tokenPct = p.limits?.monthlyTokens
-            ? Math.min(100, (p.tokensUsed / p.limits.monthlyTokens) * 100)
-            : 0;
-          const barColor = tokenPct > 85 ? '#ff4444' : tokenPct > 60 ? '#ffaa00' : '#00ff88';
-
-          return (
-            <div key={p.provider} style={styles.budgetRow}>
-              <div style={styles.budgetHeader}>
-                <span style={styles.budgetName}>{p.provider}</span>
-                <span style={styles.budgetCost}>
-                  ${p.costUsd.toFixed(2)}
-                  {p.limits?.monthlyUsd ? ` / $${p.limits.monthlyUsd}` : ''}
-                </span>
-              </div>
-
-              {/* Token bar */}
-              <div style={styles.barTrack}>
-                <div style={{
-                  ...styles.barFill,
-                  width: `${tokenPct}%`,
-                  backgroundColor: barColor,
-                  boxShadow: `0 0 8px ${barColor}40`,
-                }} />
-              </div>
-
-              <div style={styles.budgetFooter}>
-                <span>{formatTokens(p.tokensUsed)} tokens</span>
-                <span>{p.callCount} calls</span>
-                <span>{tokenPct.toFixed(0)}%</span>
-              </div>
-            </div>
-          );
-        })
-      )}
-    </div>
-  );
-}
-
-// ---- Tool Stats ----
-function ToolStats({ tools }) {
-  const stationEntries = Object.entries(tools.stationCounts || {})
-    .sort((a, b) => b[1] - a[1]);
-
-  const recentTools = tools.recent || [];
-
-  return (
-    <div style={styles.panel}>
-      <div style={styles.panelHeader}>
-        <span style={styles.panelIcon}>🛠️</span>
-        <span style={styles.panelTitle}>TOOL USAGE</span>
-      </div>
-
-      {/* Station breakdown */}
-      {stationEntries.length > 0 && (
-        <div style={styles.stationGrid}>
-          {stationEntries.map(([name, count]) => (
-            <div key={name} style={styles.stationCard}>
-              <div style={styles.stationCount}>{count}</div>
-              <div style={styles.stationName}>{name}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Recent tool calls */}
-      <div style={styles.toolRecent}>
-        <div style={styles.toolRecentHeader}>Recent Calls</div>
-        {recentTools.slice(0, 8).map((t, i) => (
-          <div key={i} style={{
-            ...styles.toolRow,
-            borderLeftColor: t.isError ? '#ff4444' : '#00ff8840',
-          }}>
-            <span style={styles.toolIcon}>{t.station?.icon || '🔧'}</span>
-            <span style={styles.toolName}>{t.name}</span>
-            {t.duration && (
-              <span style={styles.toolDuration}>{(t.duration / 1000).toFixed(1)}s</span>
-            )}
-            {t.isError && <span style={styles.toolError}>ERR</span>}
           </div>
-        ))}
-        {recentTools.length === 0 && (
-          <div style={styles.emptyFeed}>No tool calls yet</div>
-        )}
-      </div>
+
+          {/* Tools */}
+          <div style={{...s.panel,flex:1,minWidth:'190px'}}>
+            <div style={s.ph}><span style={s.phi}>&#128736;&#65039;</span><span style={s.pht}>TOOLS</span></div>
+            {Object.entries(state.tools.stationCounts||{}).length>0&&(
+              <div style={s.stGrid}>
+                {Object.entries(state.tools.stationCounts).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([n,c])=>(
+                  <div key={n} style={s.stCard}><div style={s.stCount}>{c}</div><div style={s.stName}>{n}</div></div>
+                ))}
+              </div>
+            )}
+            <div style={{fontSize:'9px',color:'#555',letterSpacing:'1px',marginBottom:'6px'}}>Recent</div>
+            {(state.tools.recent||[]).slice(0,6).map((t,i)=>(
+              <div key={i} style={{...s.tRow,borderLeftColor:t.isError?'#ff4444':'#00ff8840'}}>
+                <span style={{fontSize:'10px'}}>{t.station?.icon||'🔧'}</span>
+                <span style={s.tName}>{t.name}</span>
+                {t.duration&&<span style={s.tDur}>{(t.duration/1000).toFixed(1)}s</span>}
+                {t.isError&&<span style={s.tErr}>ERR</span>}
+              </div>
+            ))}
+            {(state.tools.recent||[]).length===0&&<div style={s.empty}>No calls yet</div>}
+          </div>
+        </div>
+      ):(
+        <div style={{textAlign:'center',padding:'20px'}}>
+          <p style={{fontSize:'13px',color:'#888'}}>{reconnecting?'Reconnecting to bridge...':'Connecting to OpenClaw Bridge...'}</p>
+          <p style={{fontSize:'10px',color:'#444',marginTop:'8px'}}>Bridge: <code style={{background:'#1a1a2e',padding:'2px 6px',borderRadius:'3px',color:'#00ff88',fontSize:'10px'}}>cd bridge && npm start</code></p>
+        </div>
+      )}
     </div>
   );
 }
 
-// ---- Utility Functions ----
-function relativeTime(timestamp, now) {
-  const diff = now - new Date(timestamp).getTime();
-  if (diff < 1000) return 'just now';
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}
+function rel(ts,now){ const d=now-new Date(ts).getTime(); if(d<1000)return'now'; if(d<60000)return`${Math.floor(d/1000)}s`; if(d<3600000)return`${Math.floor(d/60000)}m`; if(d<86400000)return`${Math.floor(d/3600000)}h`; return`${Math.floor(d/86400000)}d`; }
+function fmtTok(n){ if(n>=1e6)return`${(n/1e6).toFixed(1)}M`; if(n>=1e3)return`${(n/1e3).toFixed(0)}K`; return String(n); }
 
-function formatTokens(n) {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return String(n);
-}
-
-// ---- Global CSS ----
-const globalCSS = `
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body, #root { height: 100%; }
-
-  body {
-    background: #0a0a0f;
-    color: #ccc;
-    font-family: 'JetBrains Mono', monospace;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.6; }
-  }
-
-  @keyframes scanline {
-    0% { transform: translateY(-100%); }
-    100% { transform: translateY(100vh); }
-  }
-
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-
-  code {
-    background: #1a1a2e;
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 0.85em;
-    color: #00ff88;
-  }
+const css=`
+*{margin:0;padding:0;box-sizing:border-box}
+html,body,#root{height:100%}
+body{background:#0a0a0f;color:#ccc;font-family:'JetBrains Mono','Courier New',monospace;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:#333;border-radius:2px}
 `;
 
-// ---- Styles ----
-const styles = {
-  root: {
-    minHeight: '100vh',
-    display: 'flex',
-    flexDirection: 'column',
-    padding: '16px',
-    gap: '16px',
-    maxWidth: '1440px',
-    margin: '0 auto',
-    position: 'relative',
-  },
-
-  // Header
-  header: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: '12px 20px',
-    background: 'linear-gradient(135deg, #0d0d1a 0%, #141428 100%)',
-    border: '1px solid #1a1a2e',
-    borderRadius: '8px',
-  },
-  headerLeft: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '12px',
-  },
-  logo: {
-    fontSize: '28px',
-  },
-  title: {
-    fontSize: '14px',
-    fontWeight: 700,
-    color: '#fff',
-    letterSpacing: '3px',
-  },
-  subtitle: {
-    fontSize: '11px',
-    color: '#666',
-    marginTop: '2px',
-  },
-
-  // Connection badge
-  badge: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    padding: '6px 12px',
-    background: '#111',
-    borderRadius: '20px',
-    border: '1px solid #222',
-  },
-  dot: {
-    width: '8px',
-    height: '8px',
-    borderRadius: '50%',
-  },
-  badgeText: {
-    fontSize: '10px',
-    fontWeight: 600,
-    letterSpacing: '2px',
-  },
-
-  // Grid layout
-  grid: {
-    display: 'grid',
-    gridTemplateColumns: '300px 1fr 320px',
-    gap: '16px',
-    flex: 1,
-    minHeight: 0,
-  },
-  leftCol: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '16px',
-  },
-  centerCol: {
-    display: 'flex',
-    flexDirection: 'column',
-    minHeight: 0,
-  },
-  rightCol: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '16px',
-  },
-
-  // Panel (shared card style)
-  panel: {
-    background: 'linear-gradient(180deg, #0e0e1a 0%, #0a0a14 100%)',
-    border: '1px solid #1a1a2e',
-    borderRadius: '8px',
-    padding: '16px',
-  },
-  panelHeader: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    marginBottom: '14px',
-    paddingBottom: '10px',
-    borderBottom: '1px solid #1a1a2e',
-  },
-  panelIcon: {
-    fontSize: '14px',
-  },
-  panelTitle: {
-    fontSize: '11px',
-    fontWeight: 600,
-    color: '#888',
-    letterSpacing: '2px',
-    flex: 1,
-  },
-  panelCount: {
-    fontSize: '10px',
-    color: '#555',
-  },
-
-  // Agent cards
-  agentCard: {
-    borderLeft: '3px solid #333',
-    padding: '10px 12px',
-    marginBottom: '8px',
-    background: '#0c0c18',
-    borderRadius: '0 6px 6px 0',
-  },
-  agentTop: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: '6px',
-  },
-  agentName: {
-    fontSize: '13px',
-    fontWeight: 600,
-    color: '#eee',
-  },
-  statusPill: {
-    fontSize: '9px',
-    fontWeight: 700,
-    letterSpacing: '1.5px',
-    padding: '3px 8px',
-    borderRadius: '10px',
-  },
-  agentTool: {
-    fontSize: '11px',
-    color: '#ffaa00',
-    marginBottom: '4px',
-  },
-  agentMeta: {
-    display: 'flex',
-    gap: '8px',
-    alignItems: 'center',
-  },
-  metaTag: {
-    fontSize: '10px',
-    color: '#555',
-    background: '#111',
-    padding: '2px 6px',
-    borderRadius: '3px',
-  },
-  metaTime: {
-    fontSize: '10px',
-    color: '#444',
-    marginLeft: 'auto',
-  },
-  taskPreview: {
-    fontSize: '10px',
-    color: '#555',
-    marginTop: '6px',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-
-  // Gateway
-  gatewayStatus: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    padding: '10px',
-    border: '1px solid #222',
-    borderRadius: '6px',
-    marginBottom: '12px',
-    fontSize: '12px',
-    fontWeight: 600,
-  },
-  gatewayDot: {
-    width: '10px',
-    height: '10px',
-    borderRadius: '50%',
-  },
-  gatewayGrid: {
-    display: 'grid',
-    gridTemplateColumns: '1fr 1fr',
-    gap: '8px',
-  },
-  gwItem: {
-    padding: '6px 8px',
-    background: '#0c0c18',
-    borderRadius: '4px',
-  },
-  gwLabel: {
-    fontSize: '9px',
-    color: '#555',
-    letterSpacing: '1px',
-    marginBottom: '2px',
-  },
-  gwValue: {
-    fontSize: '11px',
-    fontWeight: 500,
-  },
-  lastChecked: {
-    fontSize: '9px',
-    color: '#333',
-    marginTop: '10px',
-    textAlign: 'right',
-  },
-
-  // Activity Feed
-  feedScroll: {
-    flex: 1,
-    overflowY: 'auto',
-    maxHeight: 'calc(100vh - 200px)',
-  },
-  feedItem: {
-    display: 'flex',
-    alignItems: 'flex-start',
-    gap: '8px',
-    padding: '8px 0',
-    borderBottom: '1px solid #111',
-    fontSize: '11px',
-  },
-  feedIcon: {
-    fontSize: '12px',
-    flexShrink: 0,
-    marginTop: '1px',
-  },
-  feedAgent: {
-    color: '#888',
-    fontWeight: 600,
-    flexShrink: 0,
-    minWidth: '70px',
-  },
-  feedMsg: {
-    color: '#aaa',
-    flex: 1,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  feedTime: {
-    color: '#333',
-    flexShrink: 0,
-    fontSize: '10px',
-    marginLeft: '4px',
-  },
-  emptyFeed: {
-    color: '#333',
-    fontSize: '12px',
-    padding: '20px 0',
-    textAlign: 'center',
-  },
-
-  // Budget
-  budgetRow: {
-    marginBottom: '16px',
-  },
-  budgetHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    marginBottom: '6px',
-  },
-  budgetName: {
-    fontSize: '12px',
-    fontWeight: 600,
-    color: '#ddd',
-  },
-  budgetCost: {
-    fontSize: '11px',
-    color: '#888',
-  },
-  barTrack: {
-    height: '6px',
-    background: '#111',
-    borderRadius: '3px',
-    overflow: 'hidden',
-    marginBottom: '4px',
-  },
-  barFill: {
-    height: '100%',
-    borderRadius: '3px',
-    transition: 'width 0.5s ease, background-color 0.5s ease',
-  },
-  budgetFooter: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    fontSize: '9px',
-    color: '#444',
-  },
-
-  // Tool Stats
-  stationGrid: {
-    display: 'grid',
-    gridTemplateColumns: '1fr 1fr',
-    gap: '6px',
-    marginBottom: '14px',
-  },
-  stationCard: {
-    background: '#0c0c18',
-    borderRadius: '6px',
-    padding: '10px',
-    textAlign: 'center',
-  },
-  stationCount: {
-    fontSize: '20px',
-    fontWeight: 700,
-    color: '#fff',
-  },
-  stationName: {
-    fontSize: '9px',
-    color: '#666',
-    letterSpacing: '1px',
-    marginTop: '2px',
-  },
-  toolRecent: {},
-  toolRecentHeader: {
-    fontSize: '10px',
-    color: '#555',
-    letterSpacing: '1px',
-    marginBottom: '8px',
-  },
-  toolRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    padding: '5px 8px',
-    borderLeft: '2px solid #00ff8840',
-    marginBottom: '4px',
-    fontSize: '11px',
-  },
-  toolIcon: {
-    fontSize: '11px',
-  },
-  toolName: {
-    color: '#aaa',
-    flex: 1,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  toolDuration: {
-    color: '#555',
-    fontSize: '10px',
-  },
-  toolError: {
-    color: '#ff4444',
-    fontSize: '9px',
-    fontWeight: 700,
-    letterSpacing: '1px',
-  },
-
-  // View toggle button
-  viewToggle: {
-    background: '#111',
-    border: '1px solid #222',
-    borderRadius: '6px',
-    color: '#00ff88',
-    fontSize: '10px',
-    fontWeight: 600,
-    letterSpacing: '1.5px',
-    padding: '6px 12px',
-    cursor: 'pointer',
-    fontFamily: "'JetBrains Mono', monospace",
-  },
-
-  // Pixel view layout
-  pixelLayout: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '12px',
-    flex: 1,
-  },
-  pixelStrip: {
-    display: 'flex',
-    gap: '12px',
-    alignItems: 'flex-start',
-  },
-
-  // Compact agent cards (pixel view)
-  compactAgents: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '6px',
-    minWidth: '160px',
-  },
-  compactAgent: {
-    background: '#0c0c18',
-    border: '1px solid #1a1a2e',
-    borderRadius: '6px',
-    padding: '8px 10px',
-    borderLeft: '3px solid #333',
-  },
-
-  // Loading
-  loading: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-    gap: '16px',
-    padding: '80px 0',
-  },
-  loadingIcon: {
-    fontSize: '48px',
-    animation: 'pulse 2s ease-in-out infinite',
-  },
-  loadingText: {
-    fontSize: '14px',
-    color: '#888',
-  },
-  loadingHint: {
-    fontSize: '11px',
-    color: '#444',
-    textAlign: 'center',
-  },
-  code: {
-    background: '#1a1a2e',
-    padding: '2px 6px',
-    borderRadius: '3px',
-    fontSize: '11px',
-    color: '#00ff88',
-  },
+const s={
+  root:{minHeight:'100vh',display:'flex',flexDirection:'column',padding:'12px',gap:'12px',maxWidth:'1200px',margin:'0 auto'},
+  header:{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 16px',background:'linear-gradient(135deg,#0d0d1a,#141428)',border:'1px solid #1a1a2e',borderRadius:'8px'},
+  hLeft:{display:'flex',alignItems:'center',gap:'10px'},
+  title:{fontSize:'13px',fontWeight:700,color:'#fff',letterSpacing:'3px'},
+  sub:{fontSize:'10px',color:'#555',marginTop:'2px'},
+  badge:{display:'flex',alignItems:'center',gap:'6px',padding:'5px 10px',background:'#111',borderRadius:'16px',border:'1px solid #222'},
+  dot:{width:'7px',height:'7px',borderRadius:'50%'},
+  badgeTxt:{fontSize:'9px',fontWeight:700,letterSpacing:'2px'},
+  scene:{background:'#0e0e1a',border:'1px solid #1a1a2e',borderRadius:'8px',padding:'12px',overflow:'hidden'},
+  locBar:{display:'flex',alignItems:'center',gap:'8px',padding:'8px 12px',marginTop:'8px',background:'#0a0a14',borderRadius:'6px',flexWrap:'wrap'},
+  locDot:{width:'8px',height:'8px',borderRadius:'50%',flexShrink:0},
+  locLabel:{fontSize:'10px',fontWeight:700,letterSpacing:'1.5px'},
+  sep:{color:'#333',fontSize:'10px'},
+  locZone:{fontSize:'11px',color:'#aaa'},
+  locTool:{fontSize:'10px',color:'#ffaa00'},
+  locProv:{fontSize:'9px',color:'#555',background:'#111',padding:'2px 6px',borderRadius:'3px',marginLeft:'auto'},
+  panels:{display:'flex',gap:'12px',flexWrap:'wrap'},
+  panel:{background:'linear-gradient(180deg,#0e0e1a,#0a0a14)',border:'1px solid #1a1a2e',borderRadius:'8px',padding:'14px'},
+  ph:{display:'flex',alignItems:'center',gap:'6px',marginBottom:'10px',paddingBottom:'8px',borderBottom:'1px solid #1a1a2e'},
+  phi:{fontSize:'13px'},
+  pht:{fontSize:'10px',fontWeight:600,color:'#888',letterSpacing:'2px',flex:1},
+  feedScroll:{maxHeight:'250px',overflowY:'auto'},
+  fi:{display:'flex',alignItems:'flex-start',gap:'6px',padding:'5px 0',borderBottom:'1px solid #111',fontSize:'10px'},
+  fiIcon:{fontSize:'11px',flexShrink:0},
+  fiAgent:{color:'#888',fontWeight:600,flexShrink:0,minWidth:'50px'},
+  fiMsg:{color:'#aaa',flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},
+  fiTime:{color:'#333',flexShrink:0,fontSize:'9px'},
+  bRow:{marginBottom:'14px'},
+  bHead:{display:'flex',justifyContent:'space-between',marginBottom:'4px'},
+  bName:{fontSize:'11px',fontWeight:600,color:'#ddd'},
+  bCost:{fontSize:'10px',color:'#888'},
+  barTrack:{height:'5px',background:'#111',borderRadius:'3px',overflow:'hidden',marginBottom:'3px'},
+  barFill:{height:'100%',borderRadius:'3px',transition:'width 0.5s ease'},
+  bFoot:{display:'flex',justifyContent:'space-between',fontSize:'8px',color:'#444'},
+  gwRow:{display:'flex',alignItems:'center',gap:'8px',padding:'6px 8px',background:'#0c0c18',borderRadius:'4px'},
+  stGrid:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'4px',marginBottom:'10px'},
+  stCard:{background:'#0c0c18',borderRadius:'5px',padding:'6px',textAlign:'center'},
+  stCount:{fontSize:'16px',fontWeight:700,color:'#fff'},
+  stName:{fontSize:'7px',color:'#666',letterSpacing:'0.5px',marginTop:'1px'},
+  tRow:{display:'flex',alignItems:'center',gap:'6px',padding:'4px 6px',borderLeft:'2px solid #00ff8840',marginBottom:'3px',fontSize:'10px'},
+  tName:{color:'#aaa',flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},
+  tDur:{color:'#555',fontSize:'9px'},
+  tErr:{color:'#ff4444',fontSize:'8px',fontWeight:700,letterSpacing:'1px'},
+  empty:{color:'#333',fontSize:'11px',padding:'16px 0',textAlign:'center'},
 };
