@@ -8,7 +8,9 @@ export default {
   // Agent directories to watch (add more as you create agents)
   // Each entry: { id, name, directory_name }
   agents: [
-    { id: 'main', name: 'Main Agent', dir: 'main' },
+    { id: 'main',  name: 'Main Agent', dir: 'main'  },
+    { id: 'scout', name: 'Scout',      dir: 'scout' },
+    { id: 'scott', name: 'Scott',      dir: 'scott' },
     // Future agents — uncomment when added:
     // { id: 'signal-feed',      name: 'SignalFeed',       dir: 'signal-feed' },
     // { id: 'market-structure',  name: 'MarketStructure',  dir: 'market-structure' },
