@@ -9,7 +9,6 @@ export default {
   // Each entry: { id, name, directory_name }
   agents: [
     { id: 'main',  name: 'Main Agent', dir: 'main'  },
-    { id: 'scout', name: 'Scout',      dir: 'scout' },
     { id: 'scott', name: 'Scott',      dir: 'scott' },
     // Future agents — uncomment when added:
     // { id: 'signal-feed',      name: 'SignalFeed',       dir: 'signal-feed' },
